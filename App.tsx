@@ -1,11 +1,18 @@
 import { Camera, useCameraDevices, useCameraPermission, useMicrophonePermission } from 'react-native-vision-camera';
-import { StyleSheet, Text, View } from 'react-native';
+import { StyleSheet, Text, View, NativeModules, Platform } from 'react-native';
 import { useEffect, useRef, useState } from 'react';
 import * as ScreenOrientation from 'expo-screen-orientation';
 import * as WebBrowser from 'expo-web-browser';
 import { makeRedirectUri, useAuthRequest, ResponseType } from 'expo-auth-session';
 import * as SecureStore from 'expo-secure-store';
 import * as MediaLibrary from 'expo-media-library';
+
+// --- FIX PER EXPO SDK 52+ / 54 ---
+// Usiamo l'import legacy per mantenere la compatibilità con copyAsync e cacheDirectory
+import * as FileSystem from 'expo-file-system/legacy'; 
+
+import { Asset } from 'expo-asset';
+import { FFmpegKit, ReturnCode } from 'ffmpeg-kit-react-native';
 
 import { BottomOverlay } from './components/BottomOverlay';
 import { SettingsMenu, SettingsItem } from './components/SettingsMenu';
@@ -57,6 +64,19 @@ export default function App() {
   }, [devices]);
 
   useEffect(() => {
+    logFfmpegAvailability();
+  }, []);
+
+  function logFfmpegAvailability() {
+    try {
+      Logger.camera('Platform:', Platform.OS);
+      Logger.camera('FFmpegKit import present:', !!FFmpegKit);
+    } catch (e) {
+      Logger.error('Failed to log FFmpeg availability', e);
+    }
+  }
+
+  useEffect(() => {
     Logger.camera('Device list for selection:', Object.values(devices as any).filter(Boolean).map((d: any) => ({ id: d.id ?? d.deviceId ?? d.name, name: d.name ?? d.label ?? d.deviceId, position: d.position })));
   }, [devices]);
 
@@ -79,6 +99,7 @@ export default function App() {
       device = list[preferredIndex] ?? list[0];
     }
   }
+
   const startManualRecording = async () => {
     if (!camera.current || !cameraReady) {
       setTopAlert({ type: 'error', text: 'Fotocamera non pronta. Riprova.' });
@@ -106,13 +127,17 @@ export default function App() {
           const uri = video?.path ?? video?.uri ?? video?.filePath ?? null;
           Logger.camera('Recording finished:', uri);
           setRecordedUri(uri);
-          // save to gallery via expo-media-library
+          
           try {
-            const saved = await saveVideoToGallery(uri);
+            // Processing con FFmpeg
+            const processed = await processVideoWithFFmpeg(uri);
+            const toSave = processed ?? uri;
+            const saved = await saveVideoToGallery(toSave as string);
+            
             if (saved) {
-              setTopAlert({ type: 'success', text: 'Recording salvato nella galleria', durationMs: 3000 });
+              setTopAlert({ type: 'success', text: 'Video salvato in Galleria!', durationMs: 3000 });
             } else {
-              setTopAlert({ type: 'error', text: 'Registrazione salvata ma non in galleria', durationMs: 4000 });
+              setTopAlert({ type: 'error', text: 'Salvato ma non in Galleria', durationMs: 4000 });
             }
           } catch (e) {
             Logger.error('Failed to save recording to gallery', e);
@@ -137,32 +162,20 @@ export default function App() {
     if (!uri) return false;
     try {
       const { status } = await MediaLibrary.requestPermissionsAsync();
-      Logger.camera('MediaLibrary permission status', status);
-      if (status !== 'granted') {
-        Logger.error('MediaLibrary permission not granted');
-        return false;
-      }
+      if (status !== 'granted') return false;
 
-      // create asset
       const asset = await MediaLibrary.createAssetAsync(uri.startsWith('file://') ? uri : `file://${uri}`);
-      Logger.camera('MediaLibrary asset created', asset);
-
-      // create or get album
       const albumName = 'DashcamX';
+      
       try {
         await MediaLibrary.createAlbumAsync(albumName, asset, false);
-        Logger.camera('Created album and added asset');
       } catch (e: any) {
-        // album likely exists — try to add asset
-        Logger.camera('createAlbum failed, attempting to add asset to existing album', e?.message ?? e);
         const albums = await MediaLibrary.getAlbumsAsync();
         const exists = albums.find((a) => a.title === albumName);
         if (exists) {
           await MediaLibrary.addAssetsToAlbumAsync([asset], exists.id, false);
-          Logger.camera('Added asset to existing album');
         }
       }
-
       return true;
     } catch (err) {
       Logger.error('saveVideoToGallery error', err);
@@ -170,6 +183,116 @@ export default function App() {
     }
   }
 
+  // --- FUNZIONE FFMPEG AGGIORNATA ---
+async function processVideoWithFFmpeg(inputUri: string | null) {
+    if (!inputUri) return null;
+
+    try {
+      if (!FFmpegKit) {
+        Logger.error('FFmpegKit native module not found');
+        return null;
+      }
+
+      // 1. Setup Percorsi
+      const input = inputUri.startsWith('file://') ? inputUri : `file://${inputUri}`;
+      const outName = `processed_${Date.now()}.mp4`;
+      
+      // Usiamo documentDirectory invece di cacheDirectory (è più persistente)
+      const outputUri = `${FileSystem.documentDirectory}${outName}`;
+      const cleanOutputPath = outputUri.replace('file://', '');
+
+      Logger.camera('FFmpeg Input:', input);
+
+      // 2. STRATEGIA FONT (Custom -> System -> Null)
+      let fontPathForFFmpeg = null;
+      
+      try {
+        // TENTATIVO A: Font Custom dagli Assets
+        const fontModule = require('./assets/fonts/overlay.ttf');
+        const fontAsset = Asset.fromModule(fontModule);
+        await fontAsset.downloadAsync();
+
+        const fontUri = `${FileSystem.documentDirectory}font_overlay.ttf`;
+        
+        // Cancelliamo se esiste già per evitare file corrotti vecchi
+        await FileSystem.deleteAsync(fontUri, { idempotent: true });
+
+        await FileSystem.copyAsync({
+          from: fontAsset.localUri || fontAsset.uri,
+          to: fontUri
+        });
+
+        // Verifica esistenza e dimensione
+        const check = await FileSystem.getInfoAsync(fontUri);
+        if (check.exists && check.size > 0) {
+          fontPathForFFmpeg = fontUri.replace('file://', '');
+          Logger.camera('Font Custom OK:', fontPathForFFmpeg);
+        } else {
+          throw new Error('Font custom vuoto o non copiato');
+        }
+
+      } catch (fontErr) {
+        Logger.warn('Font Custom fallito, provo fallback di sistema...', fontErr);
+        
+        // TENTATIVO B: Font di Sistema Android (Roboto)
+        const systemFont = '/system/fonts/Roboto-Regular.ttf';
+        const checkSys = await FileSystem.getInfoAsync(`file://${systemFont}`);
+        if (checkSys.exists) {
+            fontPathForFFmpeg = systemFont;
+            Logger.camera('Font Sistema OK:', fontPathForFFmpeg);
+        } else {
+            Logger.debug('Nessun font trovato. Il video sarà salvato senza overlay.');
+        }
+      }
+
+      // 3. COSTRUZIONE COMANDO
+      const targetBitrate = '8M'; // alza la qualità
+      const baseRotateFilter = 'transpose=1'; // 90° in senso orario
+
+      let cmd;
+
+            if (fontPathForFFmpeg) {
+        // Usa davvero il font trovato
+        const safeFontPath = fontPathForFFmpeg;
+
+        // Testo centrato orizzontalmente e appoggiato in basso sul lato lungo
+        const drawtextFilter =
+          `drawtext=fontfile='${safeFontPath}':` +
+          `text='DashcamX running!':` +
+          `fontcolor=white:` +
+          `fontsize=48:` +
+          `x=(w-text_w)/2:` +        // centro orizzontale (sul lato lungo)
+          `y=h-line_h-40`;           // bordo basso, con un piccolo margine
+
+        // 1) ruota il video, 2) scrive il testo sul frame già orizzontale
+        const filters = `${baseRotateFilter},${drawtextFilter}`;
+
+        cmd = `-y -i "${input}" -vf "${filters}" -c:v libx264 -b:v ${targetBitrate} -preset veryfast -profile:v high -level 4.1 -c:a copy "${cleanOutputPath}"`;
+      }
+
+      Logger.camera('FFmpeg Command:', cmd);
+      
+      const session = await FFmpegKit.execute(cmd);
+      const returnCode = await session.getReturnCode();
+
+      if (ReturnCode.isSuccess(returnCode)) {
+        Logger.camera('FFmpeg Success! Output:', cleanOutputPath);
+        return `file://${cleanOutputPath}`;
+      } else {
+        const logs = await session.getAllLogsAsString();
+        Logger.error('FFmpeg Failed. Logs:', logs);
+        
+        // Se fallisce l'overlay, proviamo a salvare almeno il video originale
+        setTopAlert({ type: 'warning', text: 'Overlay fallito, salvo video originale' });
+        return inputUri; 
+      }
+
+    } catch (err) {
+      Logger.error('processVideoWithFFmpeg Exception', err);
+      // In caso di crash totale della funzione, ritorna l'originale
+      return inputUri;
+    }
+  }
   const stopManualRecording = () => {
     try {
       camera.current?.stopRecording();
@@ -181,7 +304,6 @@ export default function App() {
   };
 
   const { hasPermission, requestPermission } = useCameraPermission();
-
   const { isIncidentDetected, resetIncident } = useIncidentHandler();
 
   const redirectUri = makeRedirectUri({ scheme: 'dashcamx', path: 'auth' });
@@ -312,23 +434,7 @@ export default function App() {
         }}
         onError={(e) => {
           Logger.camera('Camera error', e);
-          try {
-            const details = {
-              message: e?.message ?? null,
-              name: e?.name ?? null,
-              code: (e as any)?.code ?? (e as any)?.errorCode ?? null,
-              reason: (e as any)?.reason ?? null,
-            };
-            Logger.camera('Camera error details:', details);
-            try {
-              Logger.camera('Camera error full object:', JSON.stringify(e));
-            } catch (jsonErr) {
-              Logger.camera('Camera error (stringify failed)', jsonErr);
-            }
-          } catch (logErr) {
-            Logger.error('Failed to format camera error', logErr);
-          }
-          setTopAlert({ type: 'error', text: `Errore fotocamera: ${((e as any)?.message) ?? 'unknown'}. Controlla i permessi e i log.` });
+          setTopAlert({ type: 'error', text: `Errore fotocamera: ${((e as any)?.message) ?? 'unknown'}` });
           setCameraReady(false);
         }}
       />
@@ -457,7 +563,6 @@ const styles = StyleSheet.create({
     borderRadius: 20,
   },
   deviceButtonText: {
-
     color: 'white',
     fontSize: 12,
   },
